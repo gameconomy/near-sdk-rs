@@ -351,6 +351,123 @@ impl NonFungibleToken {
 
         Token { token_id, owner_id, metadata: token_metadata, approved_account_ids }
     }
+
+    /// Mint a new token without checking:
+    /// * Whether the caller id is equal to the `owner_id`
+    pub fn internal_update_metadata(
+        &mut self,
+        token_id: TokenId,
+        token_owner_id: &AccountId,
+        token_metadata: Option<TokenMetadata>
+    ) -> Token {
+        let initial_storage_usage = env::storage_usage();
+        if self.token_metadata_by_id.is_some() && token_metadata.is_none() {
+            env::panic_str("Must provide metadata");
+        }
+        let owner_id =
+            self.owner_by_id.get(&token_id).unwrap_or_else(|| env::panic_str("Token not found"));
+        
+        if token_owner_id != &owner_id {
+            env::panic_str("Owner mismatch");
+        }
+        // Metadata extension: Save metadata, keep variable around to return later.
+        // Note that check above already panicked if metadata extension in use but no metadata
+        // provided to call.
+        self.token_metadata_by_id
+            .as_mut()
+            .and_then(|by_id| by_id.insert(&token_id, token_metadata.as_ref().unwrap()));
+
+       
+
+        // Approval Management extension: return empty HashMap as part of Token
+        let approved_account_ids =
+            if self.approvals_by_id.is_some() { Some(HashMap::new()) } else { None };
+
+        // Return any extra attached deposit not used for storage
+        refund_deposit(env::storage_usage() - initial_storage_usage);
+
+        Token { token_id, owner_id, metadata: token_metadata, approved_account_ids }
+    }
+
+    /// Burn NFT with Token Id, checking that sender is allowed to burn.
+    /// Clear approvals, if approval extension being used.
+    /// Return previous owner and approvals.
+    pub fn burn(
+        &mut self,
+        sender_id: &AccountId,
+        #[allow(clippy::ptr_arg)] token_id: &TokenId,
+        approval_id: Option<u64>,
+        memo: Option<String>,
+    ) -> (AccountId, Option<HashMap<AccountId, u64>>) {
+        let owner_id =
+            self.owner_by_id.get(token_id).unwrap_or_else(|| env::panic_str("Token not found"));
+
+        // clear approvals, if using Approval Management extension
+        // this will be rolled back by a panic if sending fails
+        let approved_account_ids =
+            self.approvals_by_id.as_mut().and_then(|by_id| by_id.remove(token_id));
+
+        // check if authorized
+        if sender_id != &owner_id {
+            // if approval extension is NOT being used, or if token has no approved accounts
+            let app_acc_ids =
+                approved_account_ids.as_ref().unwrap_or_else(|| env::panic_str("Unauthorized"));
+
+            // Approval extension is being used; get approval_id for sender.
+            let actual_approval_id = app_acc_ids.get(sender_id);
+
+            // Panic if sender not approved at all
+            if actual_approval_id.is_none() {
+                env::panic_str("Sender not approved");
+            }
+
+            // If approval_id included, check that it matches
+            require!(
+                approval_id.is_none() || actual_approval_id == approval_id.as_ref(),
+                format!(
+                    "The actual approval_id {:?} is different from the given approval_id {:?}",
+                    actual_approval_id, approval_id
+                )
+            );
+        }
+
+        self.internal_burn(token_id, &owner_id);
+
+        log!("Burnt {} from {}", token_id, sender_id);
+        if let Some(memo) = memo {
+            log!("Memo: {}", memo);
+        }
+
+        // return owner & approvals
+        (owner_id, approved_account_ids)
+    }
+
+    /// Burn token_id from `from`
+    ///
+    /// Do not perform any safety checks or do any logging
+    pub fn internal_burn(
+        &mut self,
+        #[allow(clippy::ptr_arg)] token_id: &TokenId,
+        from: &AccountId,
+    ) {
+        // update owner
+        self.owner_by_id.remove(token_id);
+
+        // if using Enumeration standard, update owner's token lists
+        if let Some(tokens_per_owner) = &mut self.tokens_per_owner {
+            // owner_tokens should always exist, so call `unwrap` without guard
+            let mut owner_tokens = tokens_per_owner.get(from).unwrap_or_else(|| {
+                env::panic_str("Unable to access tokens per owner in unguarded call.")
+            });
+            owner_tokens.remove(token_id);
+            if owner_tokens.is_empty() {
+                tokens_per_owner.remove(from);
+            } else {
+                tokens_per_owner.insert(from, &owner_tokens);
+            }
+        }
+    }
+    
 }
 
 impl NonFungibleTokenCore for NonFungibleToken {

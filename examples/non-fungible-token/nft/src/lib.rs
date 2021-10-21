@@ -98,6 +98,32 @@ impl Contract {
         assert_eq!(env::predecessor_account_id(), self.tokens.owner_id, "Unauthorized");
         self.tokens.internal_mint(token_id, token_owner_id, Some(token_metadata))
     }
+
+    /// Burn the token with ID=`token_id` belonging to `token_owner_id`.
+    ///
+    ///
+    /// `self.tokens.burn` will enforce `predecessor_account_id` to equal the `owner_id` given in
+    /// initialization call to `new`.
+    #[payable]
+    pub fn nft_burn(
+        &mut self,
+        token_id: TokenId,
+        token_owner_id: AccountId
+    ) {
+        assert_eq!(env::predecessor_account_id(), self.tokens.owner_id, "Unauthorized");
+        self.tokens.internal_burn(&token_id, &token_owner_id)
+    }
+
+    #[payable]
+    pub fn nft_update_metadata(
+        &mut self,
+        token_id: TokenId,
+        token_owner_id: AccountId,
+        token_metadata: TokenMetadata,
+    ) -> Token {
+        assert_eq!(env::predecessor_account_id(), self.tokens.owner_id, "Unauthorized");
+        self.tokens.internal_update_metadata(token_id, &token_owner_id, Some(token_metadata))
+    }
 }
 
 near_contract_standards::impl_non_fungible_token_core!(Contract, tokens);
@@ -132,6 +158,23 @@ mod tests {
     fn sample_token_metadata() -> TokenMetadata {
         TokenMetadata {
             title: Some("Olympus Mons".into()),
+            description: Some("The tallest mountain in the charted solar system".into()),
+            media: None,
+            media_hash: None,
+            copies: Some(1u64),
+            issued_at: None,
+            expires_at: None,
+            starts_at: None,
+            updated_at: None,
+            extra: None,
+            reference: None,
+            reference_hash: None,
+        }
+    }
+
+    fn update_token_metadata() -> TokenMetadata {
+        TokenMetadata {
+            title: Some("Olympus Mons v2".into()),
             description: Some("The tallest mountain in the charted solar system".into()),
             media: None,
             media_hash: None,
@@ -325,5 +368,62 @@ mod tests {
             .attached_deposit(0)
             .build());
         assert!(!contract.nft_is_approved(token_id.clone(), accounts(1), Some(1)));
+    }
+
+
+    #[test]
+    fn test_burn() {
+        let mut context = get_context(accounts(0));
+        testing_env!(context.build());
+        let mut contract = Contract::new_default_meta(accounts(0).into());
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(MINT_STORAGE_COST)
+            .predecessor_account_id(accounts(0))
+            .build());
+        let token_id = "0".to_string();
+        contract.nft_mint(token_id.clone(), accounts(0), sample_token_metadata());
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(1)
+            .predecessor_account_id(accounts(0))
+            .build());
+        contract.nft_burn(token_id.clone(), accounts(0));
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .account_balance(env::account_balance())
+            .is_view(true)
+            .attached_deposit(0)
+            .build());
+        if let Some(token) = contract.nft_token(token_id.clone()) {
+            panic!("token not correctly burnt");
+        } 
+    }
+    
+
+    #[test]
+    fn test_update_metadata() {
+        let mut context = get_context(accounts(0));
+        testing_env!(context.build());
+        let mut contract = Contract::new_default_meta(accounts(0).into());
+
+        testing_env!(context
+            .storage_usage(env::storage_usage())
+            .attached_deposit(MINT_STORAGE_COST)
+            .predecessor_account_id(accounts(0))
+            .build());
+
+        let token_id = "0".to_string();
+        let token = contract.nft_mint(token_id.clone(), accounts(0), sample_token_metadata());
+        assert_eq!(token.token_id, token_id);
+        assert_eq!(token.owner_id, accounts(0));
+        assert_eq!(token.metadata.unwrap(), sample_token_metadata());
+        assert_eq!(token.approved_account_ids.unwrap(), HashMap::new());
+
+        let updated_token = contract.nft_update_metadata(token_id.clone(), accounts(0), update_token_metadata());
+        assert_eq!(updated_token.metadata.unwrap(), update_token_metadata());
     }
 }

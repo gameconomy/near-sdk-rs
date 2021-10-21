@@ -26,6 +26,31 @@ fn simulate_simple_transfer() {
 }
 
 #[test]
+fn simulate_simple_burn() {
+    let (root, nft, _, _, _) = init();
+
+    let token: Token = view!(nft.nft_token(TOKEN_ID.into())).unwrap_json();
+    assert_eq!(token.owner_id, root.account_id());
+
+    call!(
+        root,
+        nft.nft_burn(
+            TOKEN_ID.into(),
+            root.account_id()
+        ),
+        deposit = 1
+    )
+    .assert_success();
+
+    let res = view!(nft.nft_token(TOKEN_ID.into())).unwrap();
+    let s = String::from_utf8_lossy(&res);
+    
+    assert_eq!(s, "null");
+    
+    
+}
+
+#[test]
 fn simulate_transfer_call_fast_return_to_sender() {
     let (root, nft, _, receiver, _) = init();
 
