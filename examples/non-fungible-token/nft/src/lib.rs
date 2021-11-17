@@ -42,6 +42,7 @@ enum StorageKey {
     TokenMetadata,
     Enumeration,
     Approval,
+    Royalty
 }
 
 #[near_bindgen]
@@ -75,6 +76,7 @@ impl Contract {
                 Some(StorageKey::TokenMetadata),
                 Some(StorageKey::Enumeration),
                 Some(StorageKey::Approval),
+                Some(StorageKey::Royalty),
             ),
             metadata: LazyOption::new(StorageKey::Metadata, Some(&metadata)),
         }
@@ -94,9 +96,10 @@ impl Contract {
         token_id: TokenId,
         token_owner_id: AccountId,
         token_metadata: TokenMetadata,
+        token_royalty_distribution: UnorderedMap<AccountId, f64>
     ) -> Token {
         assert_eq!(env::predecessor_account_id(), self.tokens.owner_id, "Unauthorized");
-        self.tokens.internal_mint(token_id, token_owner_id, Some(token_metadata))
+        self.tokens.internal_mint(token_id, token_owner_id, Some(token_metadata), Some(token_royalty_distribution))
     }
 
     /// Burn the token with ID=`token_id` belonging to `token_owner_id`.
@@ -153,6 +156,13 @@ mod tests {
             .signer_account_id(predecessor_account_id.clone())
             .predecessor_account_id(predecessor_account_id);
         builder
+    }
+
+    fn sample_royalty_distribution(account_id: AccountId) -> UnorderedMap<AccountId, f64> {
+        let royalty_distribution = UnorderedMap::new();
+        royalty_distribution.insert(&account_id, 100.0);
+
+        royalty_distribution
     }
 
     fn sample_token_metadata() -> TokenMetadata {
@@ -219,7 +229,7 @@ mod tests {
             .build());
 
         let token_id = "0".to_string();
-        let token = contract.nft_mint(token_id.clone(), accounts(0), sample_token_metadata());
+        let token = contract.nft_mint(token_id.clone(), accounts(0), sample_token_metadata(), sample_royalty_distribution(accounts(0)));
         assert_eq!(token.token_id, token_id);
         assert_eq!(token.owner_id, accounts(0));
         assert_eq!(token.metadata.unwrap(), sample_token_metadata());
@@ -238,7 +248,7 @@ mod tests {
             .predecessor_account_id(accounts(0))
             .build());
         let token_id = "0".to_string();
-        contract.nft_mint(token_id.clone(), accounts(0), sample_token_metadata());
+        contract.nft_mint(token_id.clone(), accounts(0), sample_token_metadata(), sample_royalty_distribution(accounts(0)));
 
         testing_env!(context
             .storage_usage(env::storage_usage())
@@ -258,6 +268,7 @@ mod tests {
             assert_eq!(token.owner_id, accounts(1));
             assert_eq!(token.metadata.unwrap(), sample_token_metadata());
             assert_eq!(token.approved_account_ids.unwrap(), HashMap::new());
+            assert_eq!(token.royalty_percentage.unwrap(), sample_royalty_distribution(accounts(0)));
         } else {
             panic!("token not correctly created, or not found by nft_token");
         }

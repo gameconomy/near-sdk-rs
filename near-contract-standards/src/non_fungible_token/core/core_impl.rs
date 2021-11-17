@@ -71,6 +71,8 @@ pub struct NonFungibleToken {
     // required by approval extension
     pub approvals_by_id: Option<LookupMap<TokenId, HashMap<AccountId, u64>>>,
     pub next_approval_id_by_id: Option<LookupMap<TokenId, u64>>,
+
+    pub royalty_percentage: Option<TreeMap<TokenId, HashMap<AccountId, f64>>>,
 }
 
 #[derive(BorshStorageKey, BorshSerialize)]
@@ -80,18 +82,20 @@ pub enum StorageKey {
 }
 
 impl NonFungibleToken {
-    pub fn new<Q, R, S, T>(
+    pub fn new<Q, R, S, T, V>(
         owner_by_id_prefix: Q,
         owner_id: AccountId,
         token_metadata_prefix: Option<R>,
         enumeration_prefix: Option<S>,
         approval_prefix: Option<T>,
+        royalty_prefix: Option<V>,
     ) -> Self
     where
         Q: IntoStorageKey,
         R: IntoStorageKey,
         S: IntoStorageKey,
         T: IntoStorageKey,
+        V: IntoStorageKey,
     {
         let (approvals_by_id, next_approval_id_by_id) = if let Some(prefix) = approval_prefix {
             let prefix: Vec<u8> = prefix.into_storage_key();
@@ -111,6 +115,7 @@ impl NonFungibleToken {
             tokens_per_owner: enumeration_prefix.map(LookupMap::new),
             approvals_by_id,
             next_approval_id_by_id,
+            royalty_percentage: royalty_prefix.map(TreeMap::new),
         };
         this.measure_min_token_storage_cost();
         this
@@ -167,6 +172,12 @@ impl NonFungibleToken {
             tokens_per_owner.insert(&tmp_owner_id, &u);
         }
 
+        if let Some(royalty_percentage) = &mut self.royalty_percentage {
+            let mut royalties = HashMap::new();
+            royalties.insert(tmp_owner_id.clone(), 100.0);
+            royalty_percentage.insert(&tmp_token_id, &royalties);
+        }
+
         // 2. see how much space it took
         self.extra_storage_in_bytes_per_token = env::storage_usage() - initial_storage_usage;
 
@@ -186,6 +197,11 @@ impl NonFungibleToken {
         if let Some(tokens_per_owner) = &mut self.tokens_per_owner {
             tokens_per_owner.remove(&tmp_owner_id);
         }
+
+        if let Some(royalty_percentage) = &mut self.royalty_percentage {
+            royalty_percentage.remove(&tmp_token_id);
+        }
+
         self.owner_by_id.remove(&tmp_token_id);
     }
 
@@ -297,10 +313,11 @@ impl NonFungibleToken {
         token_id: TokenId,
         token_owner_id: AccountId,
         token_metadata: Option<TokenMetadata>,
+        royalties_distribution: Option<HashMap<AccountId, f64>>,
     ) -> Token {
         assert_eq!(env::predecessor_account_id(), self.owner_id, "Unauthorized");
 
-        self.internal_mint(token_id, token_owner_id, token_metadata)
+        self.internal_mint(token_id, token_owner_id, token_metadata, royalties_distribution)
     }
 
     /// Mint a new token without checking:
@@ -310,6 +327,7 @@ impl NonFungibleToken {
         token_id: TokenId,
         token_owner_id: AccountId,
         token_metadata: Option<TokenMetadata>,
+        royalties_distribution: Option<HashMap<AccountId, f64>>,
     ) -> Token {
         let initial_storage_usage = env::storage_usage();
         if self.token_metadata_by_id.is_some() && token_metadata.is_none() {
@@ -342,6 +360,14 @@ impl NonFungibleToken {
             tokens_per_owner.insert(&owner_id, &token_ids);
         }
 
+        if let Some(royalty_percentage) = &mut self.royalty_percentage {
+            if royalties_distribution.is_none() {
+                env::panic_str("Must provide royalties distribution");
+            }
+
+            royalty_percentage.insert(&token_id, royalties_distribution.as_ref().unwrap());
+        }
+
         // Approval Management extension: return empty HashMap as part of Token
         let approved_account_ids =
             if self.approvals_by_id.is_some() { Some(HashMap::new()) } else { None };
@@ -352,13 +378,13 @@ impl NonFungibleToken {
         Token { token_id, owner_id, metadata: token_metadata, approved_account_ids }
     }
 
-    /// Mint a new token without checking:
+    /// Update token's metadata without checking:
     /// * Whether the caller id is equal to the `owner_id`
     pub fn internal_update_metadata(
         &mut self,
         token_id: TokenId,
         token_owner_id: &AccountId,
-        token_metadata: Option<TokenMetadata>
+        token_metadata: Option<TokenMetadata>,
     ) -> Token {
         let initial_storage_usage = env::storage_usage();
         if self.token_metadata_by_id.is_some() && token_metadata.is_none() {
@@ -366,7 +392,7 @@ impl NonFungibleToken {
         }
         let owner_id =
             self.owner_by_id.get(&token_id).unwrap_or_else(|| env::panic_str("Token not found"));
-        
+
         if token_owner_id != &owner_id {
             env::panic_str("Owner mismatch");
         }
@@ -377,8 +403,6 @@ impl NonFungibleToken {
             .as_mut()
             .and_then(|by_id| by_id.insert(&token_id, token_metadata.as_ref().unwrap()));
 
-       
-
         // Approval Management extension: return empty HashMap as part of Token
         let approved_account_ids =
             if self.approvals_by_id.is_some() { Some(HashMap::new()) } else { None };
@@ -387,6 +411,54 @@ impl NonFungibleToken {
         refund_deposit(env::storage_usage() - initial_storage_usage);
 
         Token { token_id, owner_id, metadata: token_metadata, approved_account_ids }
+    }
+
+    /// Update NFT's metadata with Token Id, checking that sender is allowed to burn.
+    /// Clear approvals, if approval extension being used.
+    /// Return previous owner and approvals.
+    pub fn update_metadata(
+        &mut self,
+        sender_id: &AccountId,
+        token_id: TokenId,
+        approval_id: Option<u64>,
+        token_metadata: Option<TokenMetadata>,
+    ) -> (AccountId, Option<HashMap<AccountId, u64>>) {
+        let owner_id =
+            self.owner_by_id.get(&token_id).unwrap_or_else(|| env::panic_str("Token not found"));
+
+        // clear approvals, if using Approval Management extension
+        // this will be rolled back by a panic if sending fails
+        let approved_account_ids =
+            self.approvals_by_id.as_mut().and_then(|by_id| by_id.remove(&token_id));
+
+        // check if authorized
+        if sender_id != &owner_id {
+            // if approval extension is NOT being used, or if token has no approved accounts
+            let app_acc_ids =
+                approved_account_ids.as_ref().unwrap_or_else(|| env::panic_str("Unauthorized"));
+
+            // Approval extension is being used; get approval_id for sender.
+            let actual_approval_id = app_acc_ids.get(sender_id);
+
+            // Panic if sender not approved at all
+            if actual_approval_id.is_none() {
+                env::panic_str("Sender not approved");
+            }
+
+            // If approval_id included, check that it matches
+            require!(
+                approval_id.is_none() || actual_approval_id == approval_id.as_ref(),
+                format!(
+                    "The actual approval_id {:?} is different from the given approval_id {:?}",
+                    actual_approval_id, approval_id
+                )
+            );
+        }
+
+        self.internal_update_metadata(token_id, &owner_id, token_metadata);
+
+        // return owner & approvals
+        (owner_id, approved_account_ids)
     }
 
     /// Burn NFT with Token Id, checking that sender is allowed to burn.
@@ -467,7 +539,6 @@ impl NonFungibleToken {
             }
         }
     }
-    
 }
 
 impl NonFungibleTokenCore for NonFungibleToken {
